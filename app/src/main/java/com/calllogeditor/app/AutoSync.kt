@@ -46,13 +46,14 @@ class NameSyncJob : JobService() {
             try {
                 if (Auto.callOk(ctx)) {
                     var list = CallRepo.load(ctx)
+                    val cmap = if (Contacts.has(ctx)) Contacts.loadMap(ctx) else emptyMap()
                     val rules = Rules.load(ctx)
                     if (rules.any { it.enabled }) {
-                        Rules.apply(ctx, rules, list, onlyNew = true)
+                        Rules.apply(ctx, rules, list, onlyNew = true, cmap = cmap)
                         list = CallRepo.load(ctx)
                     }
                     if (Auto.namesOn(ctx) && Contacts.has(ctx)) {
-                        CallRepo.syncNames(ctx, list, Contacts.loadMap(ctx), onlyBlank = true)
+                        CallRepo.syncNames(ctx, list, cmap, onlyBlank = true)
                     }
                 }
             } catch (_: Exception) {

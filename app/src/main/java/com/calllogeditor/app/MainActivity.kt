@@ -16,6 +16,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -24,6 +25,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -93,55 +95,371 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun Root() {
     val ctx = LocalContext.current
-    var granted by remember { mutableStateOf(callOk(ctx)) }
-    var rulesPage by remember { mutableStateOf(false) }
-    var cmap by remember { mutableStateOf(mapOf<String, String>()) }
-    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted = callOk(ctx) }
-    if (!granted) Column(
-        Modifier.fillMaxSize().padding(28.dp),
-        verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        Text("Allow access", style = MaterialTheme.typography.headlineSmall)
-        Spacer(Modifier.height(12.dp))
-        Text("Call log: read and edit your calls.", style = MaterialTheme.typography.bodyMedium)
-        Text("Contacts: show the exact name for each number.", style = MaterialTheme.typography.bodyMedium)
-        Spacer(Modifier.height(20.dp))
-        Button(onClick = { launcher.launch(ALL_PERMS) }) { Text("Allow") }
-    } else if (rulesPage) RulesScreen(cmap, onBack = { rulesPage = false }, onApplied = {})
-    else CallLogScreen(onRules = { m -> cmap = m; rulesPage = true })
-}
-
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
-@Composable
-fun CallLogScreen(onRules: (Map<String, String>) -> Unit) {
-    val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
-    val snack = remember { SnackbarHostState() }
+    var granted by remember { mutableStateOf(callOk(ctx)) }
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted = callOk(ctx) }
+
+    if (!granted) {
+        Column(
+            Modifier.fillMaxSize().padding(28.dp),
+            verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text("Allow access", style = MaterialTheme.typography.headlineSmall)
+            Spacer(Modifier.height(12.dp))
+            Text("Call log: read and edit your calls.", style = MaterialTheme.typography.bodyMedium)
+            Text("Contacts: show the exact name for each number.", style = MaterialTheme.typography.bodyMedium)
+            Spacer(Modifier.height(20.dp))
+            Button(onClick = { launcher.launch(ALL_PERMS) }) { Text("Allow") }
+        }
+        return
+    }
+
+    var tab by remember { mutableStateOf(0) }
     var all by remember { mutableStateOf(listOf<CallEntry>()) }
     var cmap by remember { mutableStateOf(mapOf<String, String>()) }
     var cOk by remember { mutableStateOf(Contacts.has(ctx)) }
     var autoNames by remember { mutableStateOf(Auto.namesOn(ctx)) }
-    var q by remember { mutableStateOf("") }
-    var searching by remember { mutableStateOf(false) }
-    var filter by remember { mutableStateOf<Int?>(null) }
-    var newest by remember { mutableStateOf(true) }
-    var menu by remember { mutableStateOf(false) }
-    var sel by remember { mutableStateOf(setOf<Long>()) }
-    var editing by remember { mutableStateOf<CallEntry?>(null) }
-    var bulk by remember { mutableStateOf(false) }
-    var stats by remember { mutableStateOf(false) }
     var batteryOk by remember { mutableStateOf(Battery.exempt(ctx)) }
 
-    fun msg(t: String) { scope.launch { snack.showSnackbar(t) } }
     fun reload() {
         scope.launch {
             val (l, m) = withContext(Dispatchers.IO) { CallRepo.load(ctx) to Contacts.loadMap(ctx) }
             all = l; cmap = m
         }
     }
+
+    val batteryL = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { batteryOk = Battery.exempt(ctx) }
+    fun askBattery(onError: () -> Unit = {}) {
+        try { batteryL.launch(Battery.intent(ctx)) } catch (_: Exception) { onError() }
+    }
+
+    LaunchedEffect(Unit) {
+        reload(); Auto.refresh(ctx)
+        if (!Battery.exempt(ctx) && !Battery.askedBefore(ctx)) { Battery.markAsked(ctx); askBattery() }
+    }
+
+    Scaffold(
+        bottomBar = {
+            NavigationBar {
+                NavigationBarItem(
+                    selected = tab == 0,
+                    onClick = { tab = 0 },
+                    icon = { Icon(Icons.Default.Call, "Calls") },
+                    label = { Text("Calls") }
+                )
+                NavigationBarItem(
+                    selected = tab == 1,
+                    onClick = { tab = 1 },
+                    icon = { Icon(Icons.Default.List, "Rules") },
+                    label = { Text("Rules") }
+                )
+                NavigationBarItem(
+                    selected = tab == 2,
+                    onClick = { tab = 2 },
+                    icon = { Icon(Icons.Default.Settings, "Tools") },
+                    label = { Text("Tools") }
+                )
+            }
+        }
+    ) { outerPad ->
+        Box(Modifier.padding(bottom = outerPad.calculateBottomPadding()).fillMaxSize()) {
+            when (tab) {
+                0 -> CallsTab(
+                    all = all,
+                    cmap = cmap,
+                    cOk = cOk,
+                    onContactsGranted = { cOk = it; reload() },
+                    onReload = ::reload
+                )
+                1 -> RulesTab(cmap = cmap, onApplied = ::reload)
+                2 -> ToolsTab(
+                    all = all,
+                    cmap = cmap,
+                    cOk = cOk,
+                    autoNames = autoNames,
+                    batteryOk = batteryOk,
+                    onContactsGranted = { cOk = it; reload() },
+                    onToggleAutoNames = { on -> autoNames = on; Auto.setNames(ctx, on) },
+                    onAskBattery = ::askBattery,
+                    onReload = ::reload
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
+@Composable
+fun CallsTab(
+    all: List<CallEntry>,
+    cmap: Map<String, String>,
+    cOk: Boolean,
+    onContactsGranted: (Boolean) -> Unit,
+    onReload: () -> Unit
+) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val snack = remember { SnackbarHostState() }
+    var q by remember { mutableStateOf("") }
+    var searching by remember { mutableStateOf(false) }
+    var filter by remember { mutableStateOf<Int?>(null) }
+    var newest by remember { mutableStateOf(true) }
+    var sel by remember { mutableStateOf(setOf<Long>()) }
+    var editing by remember { mutableStateOf<CallEntry?>(null) }
+    var bulk by remember { mutableStateOf(false) }
+
+    fun msg(t: String) { scope.launch { snack.showSnackbar(t) } }
+    fun nameOf(e: CallEntry) = cmap[Contacts.norm(e.number)] ?: e.name
+    val cLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { onContactsGranted(it) }
+
+    fun deleteWithUndo(list: List<CallEntry>) {
+        if (list.isEmpty()) return
+        scope.launch {
+            withContext(Dispatchers.IO) { CallRepo.delete(ctx, list.map { it.id }.toSet()) }
+            sel = emptySet(); onReload()
+            val r = snack.showSnackbar("Deleted ${list.size}", "Undo", duration = SnackbarDuration.Long)
+            if (r == SnackbarResult.ActionPerformed) {
+                withContext(Dispatchers.IO) { list.forEach { CallRepo.save(ctx, it.copy(id = 0)) } }
+                onReload()
+            }
+        }
+    }
+
+    val counts = remember(all) { all.groupingBy { it.type }.eachCount() }
+    val shown = remember(all, cmap, q, filter, newest) {
+        all.filter {
+            (filter == null || it.type == filter) &&
+                (q.isBlank() || it.number.contains(q) || Contacts.norm(it.number).let { n -> n.isNotEmpty() && n == Contacts.norm(q) } ||
+                    (cmap[Contacts.norm(it.number)] ?: it.name).contains(q, true))
+        }.let { if (newest) it else it.reversed() }
+    }
+    val groups = remember(shown) { shown.groupBy { dayLabel(it.date) } }
+    val talk = remember(shown) { shown.filter { it.type !in NO_DURATION_TYPES }.sumOf { it.duration } }
+
+    Scaffold(
+        snackbarHost = { SnackbarHost(snack) },
+        topBar = {
+            when {
+                sel.isNotEmpty() -> TopAppBar(
+                    title = { Text("${sel.size} selected") },
+                    navigationIcon = { IconButton({ sel = emptySet() }) { Icon(Icons.Default.Close, "Cancel") } },
+                    actions = {
+                        IconButton({ sel = shown.map { it.id }.toSet() }) { Icon(Icons.Default.Check, "Select all") }
+                        IconButton({ bulk = true }) { Icon(Icons.Default.Edit, "Edit") }
+                        IconButton({ deleteWithUndo(all.filter { it.id in sel }) }) { Icon(Icons.Default.Delete, "Delete") }
+                    }
+                )
+                searching -> TopAppBar(
+                    title = {
+                        TextField(
+                            value = q,
+                            onValueChange = { q = it },
+                            singleLine = true,
+                            placeholder = { Text("Search name or number") },
+                            colors = TextFieldDefaults.colors(
+                                focusedContainerColor = Color.Transparent,
+                                unfocusedContainerColor = Color.Transparent
+                            ),
+                            trailingIcon = {
+                                if (q.isNotEmpty()) IconButton({ q = "" }) { Icon(Icons.Default.Close, "Clear") }
+                            }
+                        )
+                    },
+                    navigationIcon = { IconButton({ searching = false; q = "" }) { Icon(Icons.Default.ArrowBack, "Back") } }
+                )
+                else -> TopAppBar(
+                    title = {
+                        Column {
+                            Text("Call Log")
+                            val sub = if (talk > 0) "${shown.size} calls · ${fmtDur(talk)}" else "${shown.size} calls"
+                            Text(sub, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    },
+                    actions = {
+                        TextButton({ newest = !newest }) { Text(if (newest) "Newest" else "Oldest") }
+                        IconButton({ searching = true }) { Icon(Icons.Default.Search, "Search") }
+                    }
+                )
+            }
+        },
+        floatingActionButton = {
+            if (sel.isEmpty()) FloatingActionButton({ editing = CallEntry() }) { Icon(Icons.Default.Add, "Add") }
+        }
+    ) { pad ->
+        Column(Modifier.padding(pad)) {
+            if (!cOk) Surface(color = MaterialTheme.colorScheme.secondaryContainer) {
+                Row(Modifier.fillMaxWidth().padding(start = 14.dp, end = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Allow contacts to show saved names", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                    TextButton({ cLauncher.launch(Manifest.permission.READ_CONTACTS) }) { Text("Allow") }
+                }
+            }
+            Row(
+                Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                FilterChip(filter == null, { filter = null }, label = { Text("All (${all.size})") })
+                TYPES.forEach { (t, n) ->
+                    val c = counts[t] ?: 0
+                    if (c > 0 || filter == t || t in listOf(1, 2, 3, 5)) {
+                        FilterChip(filter == t, { filter = if (filter == t) null else t }, label = { Text("$n ($c)") })
+                    }
+                }
+            }
+            if (shown.isEmpty()) {
+                Box(Modifier.fillMaxSize(), Alignment.Center) {
+                    Text("No calls", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            } else {
+                LazyColumn(Modifier.fillMaxSize()) {
+                    groups.forEach { (label, list) ->
+                        stickyHeader(key = "h$label") {
+                            Row(
+                                Modifier.fillMaxWidth()
+                                    .background(MaterialTheme.colorScheme.background)
+                                    .padding(horizontal = 14.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(label, Modifier.weight(1f), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                                Text("${list.size}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                        items(list, key = { it.id }) { e ->
+                            val on = e.id in sel
+                            CallRow(
+                                e = e,
+                                name = nameOf(e),
+                                selected = on,
+                                onClick = { if (sel.isNotEmpty()) sel = if (on) sel - e.id else sel + e.id else editing = e },
+                                onLong = { sel = sel + e.id }
+                            )
+                        }
+                    }
+                    item { Spacer(Modifier.height(84.dp)) }
+                }
+            }
+        }
+    }
+
+    editing?.let { e ->
+        Editor(
+            e = e,
+            nameOf = { cmap[Contacts.norm(it)] },
+            onDismiss = { editing = null },
+            onDelete = { editing = null; deleteWithUndo(listOf(e)) },
+            onDuplicate = {
+                scope.launch {
+                    withContext(Dispatchers.IO) { CallRepo.save(ctx, e.copy(id = 0)) }
+                    editing = null; onReload(); msg("Duplicated")
+                }
+            },
+            onHistory = { editing = null; q = e.number; searching = true },
+            onDeleteAll = {
+                val n = Contacts.norm(e.number)
+                editing = null
+                deleteWithUndo(all.filter { Contacts.norm(it.number) == n })
+            },
+            onSave = {
+                scope.launch {
+                    val ok = withContext(Dispatchers.IO) { CallRepo.save(ctx, it) }
+                    if (ok) { editing = null; onReload() } else msg("Could not save")
+                }
+            }
+        )
+    }
+
+    if (bulk) BulkDialog(sel.size, onDismiss = { bulk = false }) { name, type ->
+        bulk = false
+        val targets = all.filter { it.id in sel }
+        scope.launch {
+            withContext(Dispatchers.IO) {
+                targets.forEach {
+                    val nt = type ?: it.type
+                    val nd = if (nt in NO_DURATION_TYPES) 0L else it.duration
+                    CallRepo.save(ctx, it.copy(name = name ?: it.name, type = nt, duration = nd))
+                }
+            }
+            sel = emptySet(); onReload(); msg("Updated ${targets.size} calls")
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun CallRow(e: CallEntry, name: String, selected: Boolean, onClick: () -> Unit, onLong: () -> Unit) {
+    val title = name.ifBlank { e.number.ifBlank { "Unknown" } }
+    val tc = typeColor(e.type)
+    Row(
+        Modifier.fillMaxWidth()
+            .background(if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.14f) else Color.Transparent)
+            .combinedClickable(onClick = onClick, onLongClick = onLong)
+            .padding(horizontal = 14.dp, vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            Modifier.size(40.dp).clip(CircleShape)
+                .background(if (selected) MaterialTheme.colorScheme.primary else tc.copy(alpha = 0.15f)),
+            Alignment.Center
+        ) {
+            when {
+                selected -> Icon(Icons.Default.Check, null, tint = MaterialTheme.colorScheme.onPrimary, modifier = Modifier.size(20.dp))
+                name.firstOrNull()?.isLetter() == true -> Text(name.first().uppercase(), color = tc, fontWeight = FontWeight.Bold)
+                else -> Icon(Icons.Default.Call, null, tint = tc, modifier = Modifier.size(18.dp))
+            }
+        }
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Surface(color = tc.copy(alpha = 0.14f), shape = RoundedCornerShape(6.dp)) {
+                    Text(
+                        typeName(e.type),
+                        Modifier.padding(horizontal = 6.dp, vertical = 1.dp),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = tc
+                    )
+                }
+                val details = listOfNotNull(
+                    if (name.isNotBlank() && e.number.isNotBlank()) e.number else null,
+                    if (e.duration > 0 && e.type !in NO_DURATION_TYPES) fmtDur(e.duration) else null
+                ).joinToString(" · ")
+                if (details.isNotEmpty()) {
+                    Text(
+                        details,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.width(8.dp))
+        Text(fmtTime(e.date), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ToolsTab(
+    all: List<CallEntry>,
+    cmap: Map<String, String>,
+    cOk: Boolean,
+    autoNames: Boolean,
+    batteryOk: Boolean,
+    onContactsGranted: (Boolean) -> Unit,
+    onToggleAutoNames: (Boolean) -> Unit,
+    onAskBattery: (() -> Unit) -> Unit,
+    onReload: () -> Unit
+) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val snack = remember { SnackbarHostState() }
+    var showAllTop by remember { mutableStateOf(false) }
+
+    fun msg(t: String) { scope.launch { snack.showSnackbar(t) } }
     fun nameOf(e: CallEntry) = cmap[Contacts.norm(e.number)] ?: e.name
 
-    val cLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { cOk = it; reload() }
+    val cLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { onContactsGranted(it) }
     val exportL = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri ->
         if (uri != null) scope.launch {
             val ok = withContext(Dispatchers.IO) {
@@ -159,214 +477,150 @@ fun CallLogScreen(onRules: (Map<String, String>) -> Unit) {
                 } catch (_: Exception) { -1 }
             }
             msg(if (n < 0) "Import failed" else "Imported $n calls")
-            reload()
+            onReload()
         }
     }
 
-    val batteryL = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { batteryOk = Battery.exempt(ctx) }
-    fun askBattery() {
-        try { batteryL.launch(Battery.intent(ctx)) } catch (_: Exception) { msg("Not supported on this phone") }
+    val topCallers = remember(all, cmap) {
+        all.groupBy { Contacts.norm(it.number).ifEmpty { "unknown" } }.map { (_, l) ->
+            val f = l.first()
+            Triple(nameOf(f).ifBlank { f.number.ifBlank { "Unknown" } }, l.size, l.filter { it.type !in NO_DURATION_TYPES }.sumOf { it.duration })
+        }.sortedByDescending { it.second }.take(10)
     }
-
-    LaunchedEffect(Unit) {
-        reload(); Auto.refresh(ctx)
-        if (!Battery.exempt(ctx) && !Battery.askedBefore(ctx)) { Battery.markAsked(ctx); askBattery() }
-    }
-
-    fun deleteWithUndo(list: List<CallEntry>) {
-        if (list.isEmpty()) return
-        scope.launch {
-            withContext(Dispatchers.IO) { CallRepo.delete(ctx, list.map { it.id }.toSet()) }
-            sel = emptySet(); reload()
-            val r = snack.showSnackbar("Deleted ${list.size}", "Undo", duration = SnackbarDuration.Long)
-            if (r == SnackbarResult.ActionPerformed) {
-                withContext(Dispatchers.IO) { list.forEach { CallRepo.save(ctx, it.copy(id = 0)) } }
-                reload()
-            }
-        }
-    }
-
-    val shown = remember(all, cmap, q, filter, newest) {
-        all.filter {
-            (filter == null || it.type == filter) &&
-                (q.isBlank() || it.number.contains(q) || Contacts.norm(it.number).let { n -> n.isNotEmpty() && n == Contacts.norm(q) } ||
-                    (cmap[Contacts.norm(it.number)] ?: it.name).contains(q, true))
-        }.let { if (newest) it else it.reversed() }
-    }
-    val groups = remember(shown) { shown.groupBy { dayLabel(it.date) } }
-    val talk = remember(shown) { shown.sumOf { it.duration } }
+    val answered = remember(all) { all.count { it.type == 1 || it.type == 2 } }
+    val missed = remember(all) { all.count { it.type in NO_DURATION_TYPES } }
+    val talk = remember(all) { all.filter { it.type !in NO_DURATION_TYPES }.sumOf { it.duration } }
 
     Scaffold(
         snackbarHost = { SnackbarHost(snack) },
-        topBar = {
-            when {
-                sel.isNotEmpty() -> TopAppBar(
-                    title = { Text("${sel.size} selected") },
-                    navigationIcon = { IconButton({ sel = emptySet() }) { Icon(Icons.Default.Close, "Cancel") } },
-                    actions = {
-                        IconButton({ sel = shown.map { it.id }.toSet() }) { Icon(Icons.Default.Check, "Select all") }
-                        IconButton({ bulk = true }) { Icon(Icons.Default.Edit, "Edit") }
-                        IconButton({ deleteWithUndo(all.filter { it.id in sel }) }) { Icon(Icons.Default.Delete, "Delete") }
-                    })
-                searching -> TopAppBar(
-                    title = {
-                        TextField(q, { q = it }, singleLine = true, placeholder = { Text("Name or number") },
-                            colors = TextFieldDefaults.colors(focusedContainerColor = Color.Transparent, unfocusedContainerColor = Color.Transparent))
-                    },
-                    navigationIcon = { IconButton({ searching = false; q = "" }) { Icon(Icons.Default.ArrowBack, "Back") } })
-                else -> TopAppBar(
-                    title = {
-                        Column {
-                            Text("Call Log")
-                            Text("${shown.size} calls · ${fmtDur(talk)}", style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                    },
-                    actions = {
-                        IconButton({ searching = true }) { Icon(Icons.Default.Search, "Search") }
-                        Box {
-                            IconButton({ menu = true }) { Icon(Icons.Default.MoreVert, "More") }
-                            DropdownMenu(menu, { menu = false }) {
-                                DropdownMenuItem(text = { Text("Rules") }, onClick = { menu = false; onRules(cmap) })
-                                if (!batteryOk) DropdownMenuItem(text = { Text("Allow background use") }, onClick = { menu = false; askBattery() })
-                                DropdownMenuItem(text = { Text("Top callers") }, onClick = { menu = false; stats = true })
-                                DropdownMenuItem(text = { Text(if (newest) "Oldest first" else "Newest first") },
-                                    onClick = { newest = !newest; menu = false })
-                                DropdownMenuItem(text = { Text("Sync names from contacts") }, onClick = {
-                                    menu = false
-                                    if (!cOk) cLauncher.launch(Manifest.permission.READ_CONTACTS)
-                                    else scope.launch {
-                                        val n = withContext(Dispatchers.IO) { CallRepo.syncNames(ctx, all, cmap) }
-                                        msg(if (n == 0) "Names already match" else "Updated $n names"); reload()
-                                    }
-                                })
-                                DropdownMenuItem(text = { Text("Auto-fill names: ${if (autoNames) "on" else "off"}") }, onClick = {
-                                    menu = false
-                                    if (!cOk) cLauncher.launch(Manifest.permission.READ_CONTACTS)
-                                    else { autoNames = !autoNames; Auto.setNames(ctx, autoNames) }
-                                })
-                                DropdownMenuItem(text = { Text("Remove duplicates") }, onClick = {
-                                    menu = false
-                                    val seen = HashSet<String>()
-                                    val extra = all.filter { !seen.add("${it.number}|${it.date}|${it.type}") }
-                                    if (extra.isEmpty()) msg("No duplicates") else deleteWithUndo(extra)
-                                })
-                                DropdownMenuItem(text = { Text("Export CSV") }, onClick = {
-                                    menu = false
-                                    exportL.launch("call_log_${SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())}.csv")
-                                })
-                                DropdownMenuItem(text = { Text("Import CSV") }, onClick = {
-                                    menu = false; importL.launch(arrayOf("*/*"))
-                                })
+        topBar = { TopAppBar(title = { Text("Tools & Insights") }) }
+    ) { pad ->
+        Column(
+            Modifier.padding(pad).fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            // 1. Insights & Top Callers
+            ElevatedCard(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("Overview", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        StatBox("Total", "${all.size}", Modifier.weight(1f))
+                        StatBox("Answered", "$answered", Modifier.weight(1f))
+                        StatBox("Missed", "$missed", Modifier.weight(1f))
+                        StatBox("Talk", fmtDur(talk), Modifier.weight(1f))
+                    }
+                    if (topCallers.isNotEmpty()) {
+                        HorizontalDivider()
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text("Top callers", Modifier.weight(1f), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                            if (topCallers.size > 5) {
+                                TextButton({ showAllTop = !showAllTop }) { Text(if (showAllTop) "Top 5" else "Top 10") }
                             }
                         }
-                    })
-            }
-        },
-        floatingActionButton = {
-            if (sel.isEmpty()) FloatingActionButton({ editing = CallEntry() }) { Icon(Icons.Default.Add, "Add") }
-        }
-    ) { pad ->
-        Column(Modifier.padding(pad)) {
-            if (!cOk) Surface(color = MaterialTheme.colorScheme.secondaryContainer) {
-                Row(Modifier.fillMaxWidth().padding(start = 14.dp, end = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text("Allow contacts to show exact names", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
-                    TextButton({ cLauncher.launch(Manifest.permission.READ_CONTACTS) }) { Text("Allow") }
-                }
-            }
-            Row(
-                Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 4.dp),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                FilterChip(filter == null, { filter = null }, label = { Text("All") })
-                TYPES.forEach { (t, n) -> FilterChip(filter == t, { filter = if (filter == t) null else t }, label = { Text(n) }) }
-            }
-            if (shown.isEmpty()) Box(Modifier.fillMaxSize(), Alignment.Center) { Text("No calls") }
-            else LazyColumn(Modifier.fillMaxSize()) {
-                groups.forEach { (label, list) ->
-                    stickyHeader(key = "h$label") {
-                        Text(label, Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background).padding(horizontal = 14.dp, vertical = 5.dp),
-                            style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
-                    }
-                    items(list, key = { it.id }) { e ->
-                        val on = e.id in sel
-                        CallRow(e, nameOf(e), on,
-                            onClick = { if (sel.isNotEmpty()) sel = if (on) sel - e.id else sel + e.id else editing = e },
-                            onLong = { sel = sel + e.id })
+                        val visible = if (showAllTop) topCallers else topCallers.take(5)
+                        visible.forEachIndexed { i, r ->
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Text("${i + 1}. ${r.first}", Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
+                                val dur = if (r.third > 0) " · ${fmtDur(r.third)}" else ""
+                                Text("${r.second} calls$dur", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
                     }
                 }
-                item { Spacer(Modifier.height(80.dp)) }
             }
+
+            // 2. Contacts & Automation
+            ElevatedCard(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Contacts & Background", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("Auto-fill names", style = MaterialTheme.typography.bodyLarge)
+                            Text("Fill contact names automatically for new calls", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Switch(autoNames, {
+                            if (!cOk) cLauncher.launch(Manifest.permission.READ_CONTACTS)
+                            else onToggleAutoNames(it)
+                        })
+                    }
+                    HorizontalDivider()
+                    ToolRow("Sync names from contacts", "Update saved call names across your log") {
+                        if (!cOk) cLauncher.launch(Manifest.permission.READ_CONTACTS)
+                        else scope.launch {
+                            val n = withContext(Dispatchers.IO) { CallRepo.syncNames(ctx, all, cmap) }
+                            msg(if (n == 0) "Names already match" else "Updated $n names")
+                            onReload()
+                        }
+                    }
+                    HorizontalDivider()
+                    Row(
+                        Modifier.fillMaxWidth().clickable(enabled = !batteryOk) {
+                            onAskBattery { msg("Not supported on this phone") }
+                        }.padding(vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("Background execution", style = MaterialTheme.typography.bodyLarge)
+                            Text(
+                                if (batteryOk) "Unrestricted — rules run reliably" else "Restricted — tap to allow background use",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (batteryOk) Color(0xFF2E7D32) else MaterialTheme.colorScheme.error
+                            )
+                        }
+                        if (!batteryOk) Icon(Icons.Default.Warning, "Restricted", tint = MaterialTheme.colorScheme.error)
+                        else Icon(Icons.Default.Check, "OK", tint = Color(0xFF2E7D32))
+                    }
+                }
+            }
+
+            // 3. Backup & Cleanup
+            ElevatedCard(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Backup & Cleanup", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    ToolRow("Export CSV", "Save all ${all.size} calls to a CSV file") {
+                        exportL.launch("call_log_${SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())}.csv")
+                    }
+                    HorizontalDivider()
+                    ToolRow("Import CSV", "Restore calls from a CSV backup") {
+                        importL.launch(arrayOf("*/*"))
+                    }
+                    HorizontalDivider()
+                    ToolRow("Remove duplicates", "Delete identical entries with same number, time, and type") {
+                        val seen = HashSet<String>()
+                        val extra = all.filter { !seen.add("${it.number}|${it.date}|${it.type}") }
+                        if (extra.isEmpty()) msg("No duplicates found")
+                        else scope.launch {
+                            withContext(Dispatchers.IO) { CallRepo.delete(ctx, extra.map { it.id }.toSet()) }
+                            onReload()
+                            msg("Removed ${extra.size} duplicates")
+                        }
+                    }
+                }
+            }
+            Spacer(Modifier.height(16.dp))
         }
     }
-
-    editing?.let { e ->
-        Editor(e, nameOf = { cmap[Contacts.norm(it)] }, onDismiss = { editing = null },
-            onDelete = { editing = null; deleteWithUndo(listOf(e)) },
-            onDuplicate = {
-                scope.launch {
-                    withContext(Dispatchers.IO) { CallRepo.save(ctx, e.copy(id = 0)) }
-                    editing = null; reload(); msg("Duplicated")
-                }
-            },
-            onHistory = { editing = null; q = e.number; searching = true },
-            onDeleteAll = {
-                val n = Contacts.norm(e.number)
-                editing = null
-                deleteWithUndo(all.filter { Contacts.norm(it.number) == n })
-            },
-            onSave = {
-                scope.launch {
-                    val ok = withContext(Dispatchers.IO) { CallRepo.save(ctx, it) }
-                    if (ok) { editing = null; reload() } else msg("Could not save")
-                }
-            })
-    }
-
-    if (bulk) BulkDialog(sel.size, onDismiss = { bulk = false }) { name, type ->
-        bulk = false
-        val targets = all.filter { it.id in sel }
-        scope.launch {
-            withContext(Dispatchers.IO) {
-                targets.forEach { CallRepo.save(ctx, it.copy(name = name ?: it.name, type = type ?: it.type)) }
-            }
-            sel = emptySet(); reload(); msg("Updated ${targets.size} calls")
-        }
-    }
-
-    if (stats) StatsDialog(all, { nameOf(it) }) { stats = false }
 }
 
-@OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun CallRow(e: CallEntry, name: String, selected: Boolean, onClick: () -> Unit, onLong: () -> Unit) {
-    val title = name.ifBlank { e.number.ifBlank { "Unknown" } }
-    Row(
-        Modifier.fillMaxWidth()
-            .background(if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f) else Color.Transparent)
-            .combinedClickable(onClick = onClick, onLongClick = onLong)
-            .padding(horizontal = 14.dp, vertical = 8.dp),
-        verticalAlignment = Alignment.CenterVertically
+private fun StatBox(label: String, value: String, modifier: Modifier = Modifier) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+        shape = RoundedCornerShape(10.dp),
+        modifier = modifier
     ) {
-        Box(Modifier.size(40.dp).clip(CircleShape).background(typeColor(e.type)), Alignment.Center) {
-            when {
-                selected -> Icon(Icons.Default.Check, null, tint = Color.White, modifier = Modifier.size(20.dp))
-                name.firstOrNull()?.isLetter() == true -> Text(name.first().uppercase(), color = Color.White, fontWeight = FontWeight.Bold)
-                else -> Icon(Icons.Default.Call, null, tint = Color.White, modifier = Modifier.size(18.dp))
-            }
+        Column(Modifier.padding(vertical = 8.dp, horizontal = 6.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(value, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, maxLines = 1)
+            Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
         }
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyLarge)
-            val sub = listOfNotNull(
-                if (name.isNotBlank() && e.number.isNotBlank()) e.number else null,
-                typeName(e.type),
-                if (e.duration > 0) fmtDur(e.duration) else null
-            ).joinToString(" · ")
-            Text(sub, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        Text(fmtTime(e.date), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+@Composable
+private fun ToolRow(title: String, subtitle: String, onClick: () -> Unit) {
+    Column(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 4.dp)) {
+        Text(title, style = MaterialTheme.typography.bodyLarge)
+        Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
@@ -396,19 +650,43 @@ fun Editor(
             Modifier.padding(horizontal = 16.dp).padding(bottom = 24.dp).verticalScroll(rememberScrollState()).imePadding(),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            Text(if (e.id == 0L) "New entry" else "Edit entry", style = MaterialTheme.typography.titleLarge)
-            OutlinedTextField(number, {
-                number = it
-                if (!touched) { val n = nameOf(it); name = n ?: ""; fromContact = n != null }
-            }, label = { Text("Number") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(if (e.id == 0L) "New call" else "Edit call", Modifier.weight(1f), style = MaterialTheme.typography.titleLarge)
+                if (e.id != 0L && number.isNotBlank()) {
+                    IconButton({
+                        try { ctx.startActivity(Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + Uri.encode(number)))) } catch (_: Exception) {}
+                    }) { Icon(Icons.Default.Phone, "Call") }
+                    TextButton({
+                        (ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
+                            .setPrimaryClip(ClipData.newPlainText("number", number))
+                    }) { Text("Copy") }
+                }
+            }
+            OutlinedTextField(
+                value = number,
+                onValueChange = {
+                    number = it
+                    if (!touched) { val n = nameOf(it); name = n ?: ""; fromContact = n != null }
+                },
+                label = { Text("Number") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
-                trailingIcon = { IconButton(pick) { Icon(Icons.Default.AccountCircle, "Pick contact") } })
-            OutlinedTextField(name, { name = it; touched = true; fromContact = false },
-                label = { Text("Name") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
-                supportingText = { if (fromContact) Text("From contacts") })
+                trailingIcon = { IconButton(pick) { Icon(Icons.Default.AccountCircle, "Pick contact") } }
+            )
+            OutlinedTextField(
+                value = name,
+                onValueChange = { name = it; touched = true; fromContact = false },
+                label = { Text("Name") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+                supportingText = { if (fromContact) Text("From contacts") }
+            )
+            Text("Type", style = MaterialTheme.typography.labelLarge)
             Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 TYPES.forEach { (t, n) -> FilterChip(type == t, { type = t }, label = { Text(n) }) }
             }
+            Text("Date & Time", style = MaterialTheme.typography.labelLarge)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton({
                     val c = Calendar.getInstance().apply { timeInMillis = date }
@@ -422,31 +700,32 @@ fun Editor(
                     }, c.get(Calendar.HOUR_OF_DAY), c.get(Calendar.MINUTE), true).show()
                 }, Modifier.weight(1f)) { Text(fmtTime(date)) }
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(min, { min = it.filter(Char::isDigit).take(5) }, label = { Text("Minutes") }, singleLine = true,
-                    modifier = Modifier.weight(1f), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
-                OutlinedTextField(sec, { sec = it.filter(Char::isDigit).take(2) }, label = { Text("Seconds") }, singleLine = true,
-                    modifier = Modifier.weight(1f), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
+            if (type !in NO_DURATION_TYPES) {
+                Text("Duration", style = MaterialTheme.typography.labelLarge)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(min, { min = it.filter(Char::isDigit).take(5) }, label = { Text("Minutes") }, singleLine = true,
+                        modifier = Modifier.weight(1f), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
+                    OutlinedTextField(sec, { sec = it.filter(Char::isDigit).take(2) }, label = { Text("Seconds") }, singleLine = true,
+                        modifier = Modifier.weight(1f), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
+                }
             }
-            if (e.id != 0L && number.isNotBlank()) Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                AssistChip(onClick = {
-                    try { ctx.startActivity(Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + Uri.encode(number)))) } catch (_: Exception) {}
-                }, label = { Text("Call") })
-                AssistChip(onClick = {
-                    (ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
-                        .setPrimaryClip(ClipData.newPlainText("number", number))
-                }, label = { Text("Copy number") })
-                AssistChip(onClick = onHistory, label = { Text("All from this number") })
-                AssistChip(onClick = onDeleteAll, label = { Text("Delete all from number") })
+            if (e.id != 0L && number.isNotBlank()) {
+                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    AssistChip(onClick = onHistory, label = { Text("All from number") })
+                    AssistChip(onClick = onDuplicate, label = { Text("Duplicate") })
+                    AssistChip(onClick = onDeleteAll, label = { Text("Delete all from number") })
+                }
             }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 if (e.id != 0L) {
-                    TextButton(onDelete) { Text("Delete") }
-                    TextButton(onDuplicate) { Text("Duplicate") }
+                    TextButton(onDelete, colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) {
+                        Text("Delete")
+                    }
                 }
                 Spacer(Modifier.weight(1f))
                 Button({
-                    val d = (min.toLongOrNull() ?: 0) * 60 + (sec.toLongOrNull() ?: 0).coerceAtMost(59)
+                    val d = if (type in NO_DURATION_TYPES) 0L
+                    else (min.toLongOrNull() ?: 0) * 60 + (sec.toLongOrNull() ?: 0).coerceAtMost(59)
                     onSave(e.copy(number = number.trim(), name = name.trim(), type = type, date = date, duration = d))
                 }) { Text("Save") }
             }
@@ -473,30 +752,6 @@ fun BulkDialog(count: Int, onDismiss: () -> Unit, onApply: (String?, Int?) -> Un
         confirmButton = {
             TextButton({ onApply(name.trim().ifBlank { null }, type) }, enabled = name.isNotBlank() || type != null) { Text("Apply") }
         },
-        dismissButton = { TextButton(onDismiss) { Text("Cancel") } })
-}
-
-@Composable
-fun StatsDialog(all: List<CallEntry>, nameOf: (CallEntry) -> String, onDismiss: () -> Unit) {
-    val rows = remember(all) {
-        all.groupBy { Contacts.norm(it.number).ifEmpty { "unknown" } }.map { (_, l) ->
-            val f = l.first()
-            Triple(nameOf(f).ifBlank { f.number.ifBlank { "Unknown" } }, l.size, l.sumOf { it.duration })
-        }.sortedByDescending { it.second }.take(10)
-    }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Top callers") },
-        text = {
-            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("${all.size} calls · ${fmtDur(all.sumOf { it.duration })} talk", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                rows.forEachIndexed { i, r ->
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("${i + 1}. ${r.first}", Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text("${r.second} · ${fmtDur(r.third)}", style = MaterialTheme.typography.bodySmall)
-                    }
-                }
-            }
-        },
-        confirmButton = { TextButton(onDismiss) { Text("Close") } })
+        dismissButton = { TextButton(onDismiss) { Text("Cancel") } }
+    )
 }

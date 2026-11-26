@@ -10,6 +10,8 @@ import android.provider.ContactsContract.CommonDataKinds.Phone
 import org.json.JSONArray
 import org.json.JSONObject
 
+val NO_DURATION_TYPES = setOf(C.MISSED_TYPE, C.REJECTED_TYPE, C.BLOCKED_TYPE)
+
 data class CallEntry(
     val id: Long = 0,
     val number: String = "",
@@ -74,11 +76,12 @@ object CallRepo {
     }
 
     private fun values(e: CallEntry) = ContentValues().apply {
+        val dur = if (e.type in NO_DURATION_TYPES) 0L else e.duration
         put(C.NUMBER, e.number)
         put(C.CACHED_NAME, e.name)
         put(C.TYPE, e.type)
         put(C.DATE, e.date)
-        put(C.DURATION, e.duration)
+        put(C.DURATION, dur)
         put(C.NEW, 0)
     }
 
@@ -116,12 +119,19 @@ object CallRepo {
     }
 }
 
-/** Calls from [number] (any format) become [type] (or are deleted, or get [name]). */
+/**
+ * Calls from [number] (any format) are automatically transformed:
+ * - [delete] removes the entry
+ * - [targetNumber] (if non-blank) replaces the caller number
+ * - [type] (if > 0) changes the call type (0 = keep original)
+ * - [name] (if non-blank) sets the cached name
+ */
 data class Rule(
     val id: Long,
     val number: String,
-    val type: Int,
+    val type: Int = 0,
     val name: String = "",
+    val targetNumber: String = "",
     val delete: Boolean = false,
     val enabled: Boolean = true,
     val since: Long = System.currentTimeMillis()
@@ -134,8 +144,16 @@ object Rules {
         val a = JSONArray(sp(ctx).getString("list", "[]"))
         (0 until a.length()).map {
             val o = a.getJSONObject(it)
-            Rule(o.getLong("id"), o.getString("number"), o.getInt("type"), o.optString("name"),
-                o.optBoolean("delete"), o.optBoolean("enabled", true), o.optLong("since", 0))
+            Rule(
+                id = o.getLong("id"),
+                number = o.getString("number"),
+                type = o.optInt("type", 0),
+                name = o.optString("name", ""),
+                targetNumber = o.optString("targetNumber", ""),
+                delete = o.optBoolean("delete", false),
+                enabled = o.optBoolean("enabled", true),
+                since = o.optLong("since", 0)
+            )
         }
     } catch (_: Exception) {
         emptyList()
@@ -144,8 +162,17 @@ object Rules {
     fun save(ctx: Context, list: List<Rule>) {
         val a = JSONArray()
         list.forEach {
-            a.put(JSONObject().put("id", it.id).put("number", it.number).put("type", it.type).put("name", it.name)
-                .put("delete", it.delete).put("enabled", it.enabled).put("since", it.since))
+            a.put(
+                JSONObject()
+                    .put("id", it.id)
+                    .put("number", it.number)
+                    .put("type", it.type)
+                    .put("name", it.name)
+                    .put("targetNumber", it.targetNumber)
+                    .put("delete", it.delete)
+                    .put("enabled", it.enabled)
+                    .put("since", it.since)
+            )
         }
         sp(ctx).edit().putString("list", a.toString()).apply()
     }
@@ -156,14 +183,28 @@ object Rules {
     }
 
     /** onlyNew: only calls made after the rule was created. Returns how many calls changed. */
-    fun apply(ctx: Context, rules: List<Rule>, entries: List<CallEntry>, onlyNew: Boolean): Int {
+    fun apply(
+        ctx: Context,
+        rules: List<Rule>,
+        entries: List<CallEntry>,
+        onlyNew: Boolean,
+        cmap: Map<String, String> = emptyMap()
+    ): Int {
         var n = 0
         for (e in entries) {
             val r = rules.firstOrNull { it.enabled && matches(it, e) && (!onlyNew || e.date >= it.since) } ?: continue
             if (r.delete) {
                 if (CallRepo.delete(ctx, setOf(e.id))) n++
             } else {
-                val ne = e.copy(type = r.type, name = if (r.name.isNotBlank()) r.name else e.name)
+                val newNumber = r.targetNumber.ifBlank { e.number }
+                val newType = if (r.type > 0) r.type else e.type
+                val newDuration = if (newType in NO_DURATION_TYPES) 0L else e.duration
+                val newName = when {
+                    r.name.isNotBlank() -> r.name
+                    r.targetNumber.isNotBlank() -> cmap[Contacts.norm(r.targetNumber)] ?: ""
+                    else -> e.name
+                }
+                val ne = e.copy(number = newNumber, type = newType, duration = newDuration, name = newName)
                 if (ne != e && CallRepo.save(ctx, ne)) n++
             }
         }
