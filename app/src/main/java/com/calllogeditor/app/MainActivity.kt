@@ -3,8 +3,12 @@ package com.calllogeditor.app
 import android.Manifest
 import android.app.DatePickerDialog
 import android.app.TimePickerDialog
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -90,8 +94,10 @@ class MainActivity : ComponentActivity() {
 fun Root() {
     val ctx = LocalContext.current
     var granted by remember { mutableStateOf(callOk(ctx)) }
+    var rulesPage by remember { mutableStateOf(false) }
+    var cmap by remember { mutableStateOf(mapOf<String, String>()) }
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted = callOk(ctx) }
-    if (granted) CallLogScreen() else Column(
+    if (!granted) Column(
         Modifier.fillMaxSize().padding(28.dp),
         verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally
     ) {
@@ -101,18 +107,20 @@ fun Root() {
         Text("Contacts: show the exact name for each number.", style = MaterialTheme.typography.bodyMedium)
         Spacer(Modifier.height(20.dp))
         Button(onClick = { launcher.launch(ALL_PERMS) }) { Text("Allow") }
-    }
+    } else if (rulesPage) RulesScreen(cmap, onBack = { rulesPage = false }, onApplied = {})
+    else CallLogScreen(onRules = { m -> cmap = m; rulesPage = true })
 }
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
-fun CallLogScreen() {
+fun CallLogScreen(onRules: (Map<String, String>) -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val snack = remember { SnackbarHostState() }
     var all by remember { mutableStateOf(listOf<CallEntry>()) }
-    var names by remember { mutableStateOf(mapOf<String, String>()) }
+    var cmap by remember { mutableStateOf(mapOf<String, String>()) }
     var cOk by remember { mutableStateOf(Contacts.has(ctx)) }
+    var autoNames by remember { mutableStateOf(Auto.namesOn(ctx)) }
     var q by remember { mutableStateOf("") }
     var searching by remember { mutableStateOf(false) }
     var filter by remember { mutableStateOf<Int?>(null) }
@@ -121,20 +129,17 @@ fun CallLogScreen() {
     var sel by remember { mutableStateOf(setOf<Long>()) }
     var editing by remember { mutableStateOf<CallEntry?>(null) }
     var bulk by remember { mutableStateOf(false) }
+    var stats by remember { mutableStateOf(false) }
+    var batteryOk by remember { mutableStateOf(Battery.exempt(ctx)) }
 
     fun msg(t: String) { scope.launch { snack.showSnackbar(t) } }
     fun reload() {
         scope.launch {
-            val (l, n) = withContext(Dispatchers.IO) {
-                val l = CallRepo.load(ctx)
-                val n = HashMap<String, String>()
-                l.map { it.number }.distinct().forEach { num -> Contacts.lookup(ctx, num)?.let { n[num] = it } }
-                l to n.toMap()
-            }
-            all = l; names = n
+            val (l, m) = withContext(Dispatchers.IO) { CallRepo.load(ctx) to Contacts.loadMap(ctx) }
+            all = l; cmap = m
         }
     }
-    fun nameOf(e: CallEntry) = names[e.number] ?: e.name
+    fun nameOf(e: CallEntry) = cmap[Contacts.norm(e.number)] ?: e.name
 
     val cLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { cOk = it; reload() }
     val exportL = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri ->
@@ -158,9 +163,18 @@ fun CallLogScreen() {
         }
     }
 
-    LaunchedEffect(Unit) { reload() }
+    val batteryL = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { batteryOk = Battery.exempt(ctx) }
+    fun askBattery() {
+        try { batteryL.launch(Battery.intent(ctx)) } catch (_: Exception) { msg("Not supported on this phone") }
+    }
+
+    LaunchedEffect(Unit) {
+        reload(); Auto.refresh(ctx)
+        if (!Battery.exempt(ctx) && !Battery.askedBefore(ctx)) { Battery.markAsked(ctx); askBattery() }
+    }
 
     fun deleteWithUndo(list: List<CallEntry>) {
+        if (list.isEmpty()) return
         scope.launch {
             withContext(Dispatchers.IO) { CallRepo.delete(ctx, list.map { it.id }.toSet()) }
             sel = emptySet(); reload()
@@ -172,10 +186,11 @@ fun CallLogScreen() {
         }
     }
 
-    val shown = remember(all, names, q, filter, newest) {
+    val shown = remember(all, cmap, q, filter, newest) {
         all.filter {
             (filter == null || it.type == filter) &&
-                (q.isBlank() || it.number.contains(q) || (names[it.number] ?: it.name).contains(q, true))
+                (q.isBlank() || it.number.contains(q) || Contacts.norm(it.number).let { n -> n.isNotEmpty() && n == Contacts.norm(q) } ||
+                    (cmap[Contacts.norm(it.number)] ?: it.name).contains(q, true))
         }.let { if (newest) it else it.reversed() }
     }
     val groups = remember(shown) { shown.groupBy { dayLabel(it.date) } }
@@ -212,15 +227,29 @@ fun CallLogScreen() {
                         Box {
                             IconButton({ menu = true }) { Icon(Icons.Default.MoreVert, "More") }
                             DropdownMenu(menu, { menu = false }) {
+                                DropdownMenuItem(text = { Text("Rules") }, onClick = { menu = false; onRules(cmap) })
+                                if (!batteryOk) DropdownMenuItem(text = { Text("Allow background use") }, onClick = { menu = false; askBattery() })
+                                DropdownMenuItem(text = { Text("Top callers") }, onClick = { menu = false; stats = true })
                                 DropdownMenuItem(text = { Text(if (newest) "Oldest first" else "Newest first") },
                                     onClick = { newest = !newest; menu = false })
                                 DropdownMenuItem(text = { Text("Sync names from contacts") }, onClick = {
                                     menu = false
                                     if (!cOk) cLauncher.launch(Manifest.permission.READ_CONTACTS)
                                     else scope.launch {
-                                        val n = withContext(Dispatchers.IO) { CallRepo.syncNames(ctx, all) }
+                                        val n = withContext(Dispatchers.IO) { CallRepo.syncNames(ctx, all, cmap) }
                                         msg(if (n == 0) "Names already match" else "Updated $n names"); reload()
                                     }
+                                })
+                                DropdownMenuItem(text = { Text("Auto-fill names: ${if (autoNames) "on" else "off"}") }, onClick = {
+                                    menu = false
+                                    if (!cOk) cLauncher.launch(Manifest.permission.READ_CONTACTS)
+                                    else { autoNames = !autoNames; Auto.setNames(ctx, autoNames) }
+                                })
+                                DropdownMenuItem(text = { Text("Remove duplicates") }, onClick = {
+                                    menu = false
+                                    val seen = HashSet<String>()
+                                    val extra = all.filter { !seen.add("${it.number}|${it.date}|${it.type}") }
+                                    if (extra.isEmpty()) msg("No duplicates") else deleteWithUndo(extra)
                                 })
                                 DropdownMenuItem(text = { Text("Export CSV") }, onClick = {
                                     menu = false
@@ -272,13 +301,19 @@ fun CallLogScreen() {
     }
 
     editing?.let { e ->
-        Editor(e, nameOf = { Contacts.lookup(ctx, it) }, onDismiss = { editing = null },
+        Editor(e, nameOf = { cmap[Contacts.norm(it)] }, onDismiss = { editing = null },
             onDelete = { editing = null; deleteWithUndo(listOf(e)) },
             onDuplicate = {
                 scope.launch {
                     withContext(Dispatchers.IO) { CallRepo.save(ctx, e.copy(id = 0)) }
                     editing = null; reload(); msg("Duplicated")
                 }
+            },
+            onHistory = { editing = null; q = e.number; searching = true },
+            onDeleteAll = {
+                val n = Contacts.norm(e.number)
+                editing = null
+                deleteWithUndo(all.filter { Contacts.norm(it.number) == n })
             },
             onSave = {
                 scope.launch {
@@ -298,6 +333,8 @@ fun CallLogScreen() {
             sel = emptySet(); reload(); msg("Updated ${targets.size} calls")
         }
     }
+
+    if (stats) StatsDialog(all, { nameOf(it) }) { stats = false }
 }
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -337,18 +374,22 @@ fun CallRow(e: CallEntry, name: String, selected: Boolean, onClick: () -> Unit, 
 @Composable
 fun Editor(
     e: CallEntry, nameOf: (String) -> String?, onDismiss: () -> Unit,
-    onDelete: () -> Unit, onDuplicate: () -> Unit, onSave: (CallEntry) -> Unit
+    onDelete: () -> Unit, onDuplicate: () -> Unit, onHistory: () -> Unit, onDeleteAll: () -> Unit,
+    onSave: (CallEntry) -> Unit
 ) {
     val ctx = LocalContext.current
     val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val contactName = nameOf(e.number)
     var number by remember { mutableStateOf(e.number) }
-    var name by remember { mutableStateOf(e.name.ifBlank { nameOf(e.number) ?: "" }) }
-    var touched by remember { mutableStateOf(e.name.isNotBlank()) }
-    var fromContact by remember { mutableStateOf(e.name.isBlank() && name.isNotBlank()) }
+    // The edit screen always starts from the contact's current name, not the old name saved in the log.
+    var name by remember { mutableStateOf(contactName ?: e.name) }
+    var touched by remember { mutableStateOf(contactName == null && e.name.isNotBlank()) }
+    var fromContact by remember { mutableStateOf(contactName != null) }
     var type by remember { mutableStateOf(e.type) }
     var date by remember { mutableStateOf(e.date) }
     var min by remember { mutableStateOf((e.duration / 60).toString()) }
     var sec by remember { mutableStateOf((e.duration % 60).toString()) }
+    val pick = rememberContactPicker { n, nm -> number = n; name = nm; touched = true; fromContact = true }
 
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheet) {
         Column(
@@ -360,7 +401,8 @@ fun Editor(
                 number = it
                 if (!touched) { val n = nameOf(it); name = n ?: ""; fromContact = n != null }
             }, label = { Text("Number") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone))
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                trailingIcon = { IconButton(pick) { Icon(Icons.Default.AccountCircle, "Pick contact") } })
             OutlinedTextField(name, { name = it; touched = true; fromContact = false },
                 label = { Text("Name") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
                 supportingText = { if (fromContact) Text("From contacts") })
@@ -385,6 +427,17 @@ fun Editor(
                     modifier = Modifier.weight(1f), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
                 OutlinedTextField(sec, { sec = it.filter(Char::isDigit).take(2) }, label = { Text("Seconds") }, singleLine = true,
                     modifier = Modifier.weight(1f), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
+            }
+            if (e.id != 0L && number.isNotBlank()) Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                AssistChip(onClick = {
+                    try { ctx.startActivity(Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + Uri.encode(number)))) } catch (_: Exception) {}
+                }, label = { Text("Call") })
+                AssistChip(onClick = {
+                    (ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
+                        .setPrimaryClip(ClipData.newPlainText("number", number))
+                }, label = { Text("Copy number") })
+                AssistChip(onClick = onHistory, label = { Text("All from this number") })
+                AssistChip(onClick = onDeleteAll, label = { Text("Delete all from number") })
             }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 if (e.id != 0L) {
@@ -421,4 +474,29 @@ fun BulkDialog(count: Int, onDismiss: () -> Unit, onApply: (String?, Int?) -> Un
             TextButton({ onApply(name.trim().ifBlank { null }, type) }, enabled = name.isNotBlank() || type != null) { Text("Apply") }
         },
         dismissButton = { TextButton(onDismiss) { Text("Cancel") } })
+}
+
+@Composable
+fun StatsDialog(all: List<CallEntry>, nameOf: (CallEntry) -> String, onDismiss: () -> Unit) {
+    val rows = remember(all) {
+        all.groupBy { Contacts.norm(it.number).ifEmpty { "unknown" } }.map { (_, l) ->
+            val f = l.first()
+            Triple(nameOf(f).ifBlank { f.number.ifBlank { "Unknown" } }, l.size, l.sumOf { it.duration })
+        }.sortedByDescending { it.second }.take(10)
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Top callers") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("${all.size} calls · ${fmtDur(all.sumOf { it.duration })} talk", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                rows.forEachIndexed { i, r ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("${i + 1}. ${r.first}", Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text("${r.second} · ${fmtDur(r.third)}", style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onDismiss) { Text("Close") } })
 }

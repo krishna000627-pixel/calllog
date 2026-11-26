@@ -12,8 +12,8 @@ android {
         applicationId = "com.calllogeditor.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "2"
+        versionCode = 4
+        versionName = "4"
     }
     signingConfigs {
         if (ksPath != null) {
